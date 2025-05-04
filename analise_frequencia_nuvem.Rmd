@@ -1,0 +1,785 @@
+---
+title: "Análise Textual de PDF com Agrupamento de Palavras"
+author: "Seu Nome"
+date: "`r Sys.Date()`"
+output: 
+  html_document:
+    theme: flatly
+    df_print: paged
+runtime: shiny
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE)
+# Carregar todas as bibliotecas necessárias
+library(shiny)
+library(pdftools)
+library(tm)
+library(wordcloud)
+library(ggplot2)
+library(RColorBrewer)
+library(tidytext)    # Para tokenização
+library(dplyr)       # Para manipulação de dados
+library(stringr)     # Para funções de string
+library(tibble)      # Para criar tibbles
+library(stringdist)  # Para calcular distância entre strings
+```
+
+## 📥 Upload e Análise do Arquivo PDF
+
+```{r ui-upload, echo=FALSE}
+fluidRow(
+  column(6, 
+    fileInput("arquivo_pdf", "Escolha um arquivo PDF", 
+              accept = ".pdf",
+              buttonLabel = "Procurar...")
+  ),
+  column(6,
+    actionButton("analisar", "Analisar Documento", 
+                icon = icon("play"),
+                class = "btn-primary",
+                style = "margin-top: 25px;")
+  )
+)
+```
+
+```{r server-analise, echo=FALSE}
+# Variáveis reativas para controlar o estado da análise
+analise_realizada <- reactiveValues(valor = FALSE)
+
+# Observer para o botão de análise
+observeEvent(input$analisar, {
+  req(input$arquivo_pdf)
+  analise_realizada$valor <- TRUE
+})
+
+# Texto extraído do PDF
+output_text <- reactive({
+  req(input$arquivo_pdf)
+  req(analise_realizada$valor)
+  # Extrair todas as páginas do PDF e manter a formatação por página
+  texto_pdf <- pdftools::pdf_text(input$arquivo_pdf$datapath)
+  return(texto_pdf)  # Retorna um vetor com cada página como um elemento
+})
+
+# Função para normalizar palavras (remover acentos, converter para minúsculas, etc.)
+normalizar_palavra <- function(palavra) {
+  # Converter para minúsculas
+  palavra <- tolower(palavra)
+  
+  # Remover acentos e caracteres especiais
+  palavra <- iconv(palavra, to = "ASCII//TRANSLIT")
+  
+  # Substituições específicas (pode ser expandido conforme necessário)
+  palavra <- gsub("ç", "c", palavra)
+  palavra <- gsub("ã", "a", palavra)
+  palavra <- gsub("õ", "o", palavra)
+  palavra <- gsub("á|à|â", "a", palavra)
+  palavra <- gsub("é|è|ê", "e", palavra)
+  palavra <- gsub("í|ì|î", "i", palavra)
+  palavra <- gsub("ó|ò|ô", "o", palavra)
+  palavra <- gsub("ú|ù|û", "u", palavra)
+  
+  return(palavra)
+}
+
+# Função corrigida para agrupar palavras similares 
+agrupar_palavras_similares <- function(termos, threshold = 0.2) {
+  # Se não há termos, retorna uma lista vazia
+  if (nrow(termos) == 0) {
+    return(termos)
+  }
+  
+  # Normalizar todas as palavras
+  termos$termo_normalizado <- sapply(termos$termo, normalizar_palavra)
+  
+  # Criar um data frame para armazenar o resultado final
+  resultado <- data.frame(
+    termo = character(),
+    frequencia = numeric(),
+    variantes = character(),
+    stringsAsFactors = FALSE
+  )
+  
+  # Agrupar por termo normalizado
+  termos_agrupados <- split(termos, termos$termo_normalizado)
+  
+  # Para cada grupo, criar uma entrada no resultado
+  for (grupo_nome in names(termos_agrupados)) {
+    grupo <- termos_agrupados[[grupo_nome]]
+    
+    # Pegar o termo mais frequente como principal
+    idx_principal <- which.max(grupo$frequencia)
+    termo_principal <- grupo$termo[idx_principal]
+    
+    # Obter variantes (excluindo o termo principal)
+    variantes <- grupo$termo[grupo$termo != termo_principal]
+    
+    # Calcular frequência total
+    freq_total <- sum(grupo$frequencia)
+    
+    # Variantes como string, ou "nenhuma" se não houver
+    variantes_str <- if (length(variantes) > 0) paste(variantes, collapse = ", ") else "nenhuma"
+    
+    # Adicionar ao resultado
+    resultado <- rbind(resultado, data.frame(
+      termo = termo_principal,
+      frequencia = freq_total,
+      variantes = variantes_str,
+      stringsAsFactors = FALSE
+    ))
+  }
+  
+  # Ordenar por frequência
+  resultado <- resultado[order(resultado$frequencia, decreasing = TRUE), ]
+  
+  # Garantir que o data frame tenha rownames corretos e consecutivos
+  rownames(resultado) <- 1:nrow(resultado)
+  
+  return(resultado)
+}
+
+# Tokenização do texto para frequência mais precisa
+texto_tokenizado <- reactive({
+  req(output_text())
+  
+  # Combinar todas as páginas
+  texto_completo <- paste(output_text(), collapse = " ")
+  
+  # Usar tibble e unnest_tokens para processamento mais preciso
+  tokens <- tibble(texto = texto_completo) %>%
+    unnest_tokens(palavra, texto) %>%
+    # Filtragem adicional
+    filter(nchar(palavra) > 1) %>%
+    # Remover stopwords
+    anti_join(tibble(palavra = stopwords("portuguese")), by = "palavra")
+    
+  return(tokens)
+})
+
+# Análise de frequência de termos usando a abordagem do tidytext
+frequencia_termos <- reactive({
+  req(texto_tokenizado())
+  
+  # Contar ocorrências e ordenar
+  termos <- texto_tokenizado() %>%
+    count(palavra, sort = TRUE) %>%
+    rename(termo = palavra, frequencia = n)
+    
+  return(termos)
+})
+
+# Frequência de termos agrupados (palavras similares)
+frequencia_termos_agrupados <- reactive({
+  req(frequencia_termos())
+  
+  # Agrupar palavras similares
+  termos_agrupados <- agrupar_palavras_similares(frequencia_termos())
+  
+  return(termos_agrupados)
+})
+
+# Função de busca inteligente para encontrar palavras com prefixo
+buscar_palavra_inteligente <- function(texto, termo, case_sensitive = FALSE) {
+  # Verificar se o termo está vazio
+  if (trimws(termo) == "") {
+    return(list(
+      total = 0,
+      por_pagina = rep(0, length(texto)),
+      posicoes = list(),
+      palavras_encontradas = character(0)
+    ))
+  }
+  
+  # Normalizar o termo de busca
+  termo_norm <- normalizar_palavra(termo)
+  
+  # Preparar o padrão de busca para correspondência parcial
+  if (!case_sensitive) {
+    padrao <- paste0("\\b", tolower(termo), "\\w*\\b")
+    texto_proc <- tolower(texto)
+    
+    # Variantes com acentos e cedilhas
+    variantes <- c(
+      paste0("\\b", gsub("c", "[cç]", termo_norm), "\\w*\\b"),
+      paste0("\\b", gsub("a", "[aáàãâ]", termo_norm), "\\w*\\b"),
+      paste0("\\b", gsub("e", "[eéèê]", termo_norm), "\\w*\\b"),
+      paste0("\\b", gsub("i", "[iíìî]", termo_norm), "\\w*\\b"),
+      paste0("\\b", gsub("o", "[oóòôõ]", termo_norm), "\\w*\\b"),
+      paste0("\\b", gsub("u", "[uúùû]", termo_norm), "\\w*\\b")
+    )
+    
+    # Remover padrões duplicados
+    variantes <- unique(variantes)
+  } else {
+    padrao <- paste0("\\b", termo, "\\w*\\b")
+    texto_proc <- texto
+    variantes <- c()
+  }
+  
+  # Lista para armazenar palavras completas encontradas
+  palavras_encontradas <- list()
+  
+  # Função para encontrar matches com um padrão
+  find_matches <- function(texto, padrao) {
+    matches_list <- lapply(seq_along(texto), function(i) {
+      pagina <- texto[i]
+      matches <- gregexpr(padrao, pagina, ignore.case = !case_sensitive)
+      
+      if (matches[[1]][1] != -1) {
+        starts <- matches[[1]]
+        lengths <- attr(matches[[1]], "match.length")
+        
+        palavras <- mapply(function(start, length) {
+          substr(pagina, start, start + length - 1)
+        }, starts, lengths, SIMPLIFY = FALSE)
+        
+        list(
+          pagina = i,
+          ocorrencias = length(starts),
+          palavras = unlist(palavras)
+        )
+      } else {
+        NULL
+      }
+    })
+    
+    # Filtrar resultados nulos
+    matches_list[!sapply(matches_list, is.null)]
+  }
+  
+  # Buscar com o padrão principal
+  matches_principal <- find_matches(texto_proc, padrao)
+  
+  # Buscar com variantes se não for case sensitive
+  matches_variantes <- list()
+  if (!case_sensitive && length(variantes) > 0) {
+    for (var_padrao in variantes) {
+      matches_var <- find_matches(texto_proc, var_padrao)
+      if (length(matches_var) > 0) {
+        matches_variantes <- c(matches_variantes, matches_var)
+      }
+    }
+  }
+  
+  # Combinar resultados
+  todos_matches <- c(matches_principal, matches_variantes)
+  
+  # Se não há resultados, retornar uma lista vazia
+  if (length(todos_matches) == 0) {
+    return(list(
+      total = 0,
+      por_pagina = rep(0, length(texto)),
+      posicoes = list(),
+      palavras_encontradas = character(0)
+    ))
+  }
+  
+  # Extrair todas as palavras encontradas
+  todas_palavras <- unique(unlist(lapply(todos_matches, function(m) m$palavras)))
+  
+  # Contar ocorrências por página
+  ocorrencias_pagina <- rep(0, length(texto))
+  for (match in todos_matches) {
+    ocorrencias_pagina[match$pagina] <- ocorrencias_pagina[match$pagina] + match$ocorrencias
+  }
+  
+  # Preparar posições para destaque
+  posicoes <- lapply(seq_along(texto_proc), function(i) {
+    matches_pagina <- Filter(function(m) m$pagina == i, todos_matches)
+    
+    if (length(matches_pagina) > 0) {
+      # Extrair todas as palavras encontradas nesta página
+      palavras_pagina <- unique(unlist(lapply(matches_pagina, function(m) m$palavras)))
+      
+      # Localizar posições de cada palavra
+      pos_list <- lapply(palavras_pagina, function(palavra) {
+        palavra_padrao <- paste0("\\b", palavra, "\\b")
+        word_matches <- gregexpr(palavra_padrao, texto_proc[i], ignore.case = !case_sensitive)
+        
+        if (word_matches[[1]][1] != -1) {
+          starts <- word_matches[[1]]
+          lengths <- attr(word_matches[[1]], "match.length")
+          
+          data.frame(
+            palavra = palavra,
+            inicio = starts,
+            fim = starts + lengths - 1
+          )
+        } else {
+          NULL
+        }
+      })
+      
+      # Combinar os resultados
+      pos_df <- do.call(rbind, pos_list[!sapply(pos_list, is.null)])
+      
+      if (!is.null(pos_df) && nrow(pos_df) > 0) {
+        list(
+          pagina = i,
+          posicoes = pos_df
+        )
+      } else {
+        NULL
+      }
+    } else {
+      NULL
+    }
+  })
+  
+  # Filtrar posições nulas
+  posicoes <- posicoes[!sapply(posicoes, is.null)]
+  
+  list(
+    total = sum(ocorrencias_pagina),
+    por_pagina = ocorrencias_pagina,
+    posicoes = posicoes,
+    palavras_encontradas = todas_palavras
+  )
+}
+```
+
+## 📊 Resultados da Análise
+
+```{r ui-resultados, echo=FALSE}
+# Mostrar os resultados apenas quando a análise for executada
+conditionalPanel(
+  condition = "input.analisar",
+  tabsetPanel(
+    tabPanel("Texto Extraído", 
+      h4("Texto do PDF (por página):"),
+      uiOutput("paginas_pdf")
+    ),
+    tabPanel("Termos Frequentes",
+      fluidRow(
+        column(4,
+          radioButtons("tipo_contagem", "Tipo de contagem:", 
+                    choices = c("Individual" = "individual", 
+                                "Agrupada (palavras similares)" = "agrupada"),
+                    selected = "agrupada"),
+          h4("Controle de Frequência:"),
+          sliderInput("min_freq", "Frequência mínima:", 
+                      min = 1, max = 10, value = 1, step = 1)
+        ),
+        column(8,
+          h4("Buscador Inteligente:"),
+          fluidRow(
+            column(7, textInput("busca_termo", "Digite parte da palavra:", placeholder = "Ex: manuten")),
+            column(3, checkboxInput("case_sensitive", "Diferenciar maiúsculas/minúsculas", FALSE)),
+            column(2, actionButton("buscar", "Buscar", class = "btn-info"))
+          ),
+          uiOutput("resultado_busca")
+        )
+      ),
+      h4("Tabela de Termos Mais Frequentes"),
+      tableOutput("tabela_termos"),
+      h4("Gráfico de Barras (Top 10)"),
+      plotOutput("grafico_barras")
+    ),
+    tabPanel("Nuvem de Palavras",
+      h4("Visualização dos Termos Mais Frequentes"),
+      radioButtons("tipo_contagem_nuvem", "Tipo de contagem:", 
+                 choices = c("Individual" = "individual", 
+                             "Agrupada (palavras similares)" = "agrupada"),
+                 selected = "agrupada", inline = TRUE),
+      plotOutput("nuvem_palavras", height = "500px")
+    ),
+    tabPanel("Buscador Avançado",
+      h4("Busca Avançada no Documento"),
+      p("Digite parte da palavra para encontrar todas as palavras que começam com esse prefixo, incluindo variações com/sem acentos"),
+      fluidRow(
+        column(6, textInput("busca_avancada", "Digite parte da palavra:", placeholder = "Ex: manuten")),
+        column(3, checkboxInput("case_sensitive_avancado", "Diferenciar maiúsculas/minúsculas", FALSE)),
+        column(3, actionButton("buscar_avancado", "Buscar", class = "btn-primary"))
+      ),
+      br(),
+      # Área para exibir palavras encontradas
+      uiOutput("palavras_encontradas"),
+      # Área para exibir resultados da busca
+      uiOutput("resultado_busca_avancada"),
+      hr(),
+      h4("Visualização do Texto com Destaque:"),
+      uiOutput("texto_destacado")
+    )
+  )
+)
+```
+
+```{r server-resultados, echo=FALSE}
+# Mostrar texto extraído página por página com formatação melhorada
+output$paginas_pdf <- renderUI({
+  req(output_text())
+  
+  # Criar uma lista de elementos UI para cada página
+  paginas <- lapply(seq_along(output_text()), function(i) {
+    # Para cada página, criar um painel
+    wellPanel(
+      h5(paste("Página", i)),
+      tags$pre(
+        style = "white-space: pre-wrap; word-wrap: break-word; max-height: 300px; overflow-y: auto;",
+        output_text()[i]
+      )
+    )
+  })
+  
+  # Combinar todos os elementos em um único objeto UI
+  do.call(tagList, paginas)
+})
+
+# Tabela de termos frequentes com filtragem - CORRIGIDA
+output$tabela_termos <- renderTable({
+  req(input$min_freq)
+  
+  if (input$tipo_contagem == "individual") {
+    req(frequencia_termos())
+    df <- frequencia_termos() %>%
+      filter(frequencia >= input$min_freq) %>%
+      head(20)
+  } else {
+    req(frequencia_termos_agrupados())
+    df <- frequencia_termos_agrupados() %>%
+      filter(frequencia >= input$min_freq) %>%
+      head(20)
+  }
+  
+  # Garantir que não há problemas com rownames
+  rownames(df) <- NULL
+  
+  return(df)
+}, rownames = FALSE)
+
+# Gráfico de barras atualizado - CORRIGIDO
+output$grafico_barras <- renderPlot({
+  req(input$min_freq)
+  
+  if (input$tipo_contagem == "individual") {
+    req(frequencia_termos())
+    # Filtrar por frequência mínima e pegar os top 10
+    top <- frequencia_termos() %>%
+      filter(frequencia >= input$min_freq) %>%
+      head(10)
+    
+    # Garantir que não há valores NA
+    top <- top[complete.cases(top), ]
+    
+    # Criar o gráfico de barras
+    if (nrow(top) > 0) {
+      ggplot(top, aes(x = reorder(termo, frequencia), y = frequencia)) +
+        geom_bar(stat = "identity", fill = "steelblue") +
+        geom_text(aes(label = frequencia), hjust = -0.2, size = 3.5) +  # Mostrar o número exato
+        coord_flip() +
+        labs(title = "Top 10 Termos", x = "Termo", y = "Frequência") +
+        theme_minimal() +
+        theme(axis.text.y = element_text(size = 11))
+    } else {
+      # Gráfico vazio se não houver dados
+      ggplot() + 
+        annotate("text", x = 0.5, y = 0.5, label = "Sem dados para exibir") +
+        theme_void() +
+        xlim(0, 1) + ylim(0, 1)
+    }
+  } else {
+    req(frequencia_termos_agrupados())
+    # Filtrar por frequência mínima e pegar os top 10
+    top <- frequencia_termos_agrupados() %>%
+      filter(frequencia >= input$min_freq) %>%
+      head(10)
+    
+    # Garantir que não há valores NA
+    top <- top[complete.cases(top), ]
+    
+    # Criar o gráfico de barras
+    if (nrow(top) > 0) {
+      ggplot(top, aes(x = reorder(termo, frequencia), y = frequencia)) +
+        geom_bar(stat = "identity", fill = "steelblue") +
+        geom_text(aes(label = frequencia), hjust = -0.2, size = 3.5) +  # Mostrar o número exato
+        coord_flip() +
+        labs(title = "Top 10 Termos (Agrupados)", x = "Termo", y = "Frequência") +
+        theme_minimal() +
+        theme(axis.text.y = element_text(size = 11))
+    } else {
+      # Gráfico vazio se não houver dados
+      ggplot() + 
+        annotate("text", x = 0.5, y = 0.5, label = "Sem dados para exibir") +
+        theme_void() +
+        xlim(0, 1) + ylim(0, 1)
+    }
+  }
+})
+
+# Nuvem de palavras atualizada - CORRIGIDA
+output$nuvem_palavras <- renderPlot({
+  req(input$min_freq)
+  
+  # Selecionar os dados com base no tipo de contagem
+  if (input$tipo_contagem_nuvem == "individual") {
+    req(frequencia_termos())
+    palavras_freq <- frequencia_termos() %>%
+      filter(frequencia >= input$min_freq)
+  } else {
+    req(frequencia_termos_agrupados())
+    palavras_freq <- frequencia_termos_agrupados() %>%
+      filter(frequencia >= input$min_freq) %>%
+      select(termo, frequencia)  # Garantir que apenas as colunas necessárias estão presentes
+  }
+  
+  # Remover linhas com NA em qualquer coluna
+  palavras_freq <- palavras_freq[complete.cases(palavras_freq), ]
+  
+  # Garantir que nomes de linhas estão corretos
+  rownames(palavras_freq) <- NULL
+  
+  # Garantir que há palavras suficientes após a filtragem
+  if(nrow(palavras_freq) > 0) {
+    set.seed(123)  # Para reprodutibilidade
+    tryCatch({
+      wordcloud(words = palavras_freq$termo,
+                freq = palavras_freq$frequencia,
+                min.freq = input$min_freq,
+                max.words = 100,
+                random.order = FALSE,
+                rot.per = 0.35,  # Rotação de algumas palavras
+                colors = brewer.pal(8, "Dark2"),
+                scale = c(4, 0.5))  # Escala melhorada
+    }, error = function(e) {
+      # Em caso de erro, mostrar mensagem
+      plot(0, 0, type = "n", axes = FALSE, xlab = "", ylab = "")
+      text(0, 0, paste("Erro ao gerar nuvem:", e$message), cex = 1.2)
+    })
+  } else {
+    # Mensagem para quando não há palavras suficientes
+    plot(0, 0, type = "n", axes = FALSE, xlab = "", ylab = "")
+    text(0, 0, "Não há palavras suficientes com esta frequência mínima", cex = 1.5)
+  }
+})
+
+# Busca inteligente na aba de Termos Frequentes
+observeEvent(input$buscar, {
+  req(output_text())
+  req(input$busca_termo)
+  
+  # Buscar a palavra no texto
+  resultado <- buscar_palavra_inteligente(output_text(), input$busca_termo, input$case_sensitive)
+  
+  # Exibir o resultado
+  output$resultado_busca <- renderUI({
+    if (resultado$total > 0) {
+      tags$div(
+        class = "well",
+        style = "background-color: #f8f9fa; border-left: 4px solid #5bc0de; padding: 15px;",
+        tags$div(
+          tags$strong("Palavras encontradas: "),
+          paste(length(resultado$palavras_encontradas), 
+                ifelse(length(resultado$palavras_encontradas) == 1, "palavra", "palavras"), 
+                "relacionadas a", tags$b(input$busca_termo))
+        ),
+        tags$div(
+          style = "display: flex; flex-wrap: wrap; gap: 5px; margin-top: 10px;",
+          lapply(resultado$palavras_encontradas, function(palavra) {
+            # Contar ocorrências dessa palavra específica
+            ocorrencias_palavra <- sum(sapply(resultado$posicoes, function(pos) {
+              if (!is.null(pos$posicoes)) {
+                sum(pos$posicoes$palavra == palavra)
+              } else {
+                0
+              }
+            }))
+            
+            tags$span(
+              class = "badge",
+              style = "background-color: #5bc0de; margin: 2px; padding: 5px;",
+              paste0(palavra, " (", ocorrencias_palavra, ")")
+            )
+          })
+        ),
+        tags$hr(),
+        tags$p("Total de ocorrências: ", tags$b(resultado$total)),
+        tags$p("Distribuição por página:"),
+        tags$div(
+          style = "display: flex; flex-wrap: wrap; gap: 5px;",
+          lapply(seq_along(resultado$por_pagina), function(i) {
+            if (resultado$por_pagina[i] > 0) {
+              tags$span(
+                style = "background-color: #e2e3e5; padding: 3px 8px; border-radius: 4px; margin: 2px;",
+                paste("Página", i, ":", resultado$por_pagina[i])
+              )
+            }
+          })
+        )
+      )
+    } else {
+      tags$div(
+        class = "alert alert-danger",
+        tags$strong("Não encontrado!"), 
+        paste(" Não foram encontradas palavras relacionadas a", tags$b(input$busca_termo))
+      )
+    }
+  })
+})
+
+# Variável reativa para armazenar os resultados da busca avançada
+resultados_busca_avancada <- reactiveValues(dados = NULL)
+
+# Busca avançada
+observeEvent(input$buscar_avancado, {
+  req(output_text())
+  req(input$busca_avancada)
+  
+  # Buscar a palavra no texto
+  resultado <- buscar_palavra_inteligente(output_text(), input$busca_avancada, input$case_sensitive_avancado)
+  
+  # Armazenar os resultados para uso posterior
+  resultados_busca_avancada$dados <- resultado
+  
+  # Exibir as palavras encontradas
+  output$palavras_encontradas <- renderUI({
+    if (length(resultado$palavras_encontradas) > 0) {
+      tags$div(
+        class = "alert alert-info",
+        tags$strong("Palavras encontradas: "),
+        tags$div(
+          style = "display: flex; flex-wrap: wrap; gap: 5px; margin-top: 10px;",
+          lapply(resultado$palavras_encontradas, function(palavra) {
+            # Contar ocorrências dessa palavra específica
+            ocorrencias_palavra <- sum(sapply(resultado$posicoes, function(pos) {
+              if (!is.null(pos$posicoes)) {
+                sum(pos$posicoes$palavra == palavra)
+              } else {
+                0
+              }
+            }))
+            
+            tags$span(
+              class = "badge",
+              style = "background-color: #5bc0de; margin: 2px; padding: 5px;",
+              paste0(palavra, " (", ocorrencias_palavra, ")")
+            )
+          })
+        )
+      )
+    } else {
+      tags$div(
+        class = "alert alert-danger",
+        "Nenhuma palavra encontrada com este prefixo."
+      )
+    }
+  })
+  
+  # Exibir o resultado da busca
+  output$resultado_busca_avancada <- renderUI({
+    if (resultado$total > 0) {
+      tags$div(
+        class = "alert alert-success",
+        tags$strong("Resultados da busca:"), 
+        paste(" Encontradas", resultado$total, 
+              ifelse(resultado$total == 1, "ocorrência", "ocorrências"), 
+              "de palavras relacionadas a", tags$b(input$busca_avancada)),
+        tags$hr(),
+        tags$p("Clique em uma página para ver o texto com destaque:"),
+        tags$div(
+          style = "display: flex; flex-wrap: wrap; gap: 10px;",
+          lapply(seq_along(resultado$por_pagina), function(i) {
+            if (resultado$por_pagina[i] > 0) {
+              actionButton(
+                inputId = paste0("pagina_", i),
+                label = paste("Página", i, "(", resultado$por_pagina[i], ")"),
+                class = "btn-sm btn-info",
+                onclick = sprintf("Shiny.setInputValue('pagina_selecionada', %d);", i)
+              )
+            }
+          })
+        )
+      )
+    } else {
+      tags$div(
+        class = "alert alert-danger",
+        tags$strong("Nenhum resultado!"), 
+        paste(" Não foram encontradas palavras relacionadas a", tags$b(input$busca_avancada))
+      )
+    }
+  })
+})
+
+# Observer para seleção de página e destaque de texto
+observeEvent(input$pagina_selecionada, {
+  req(output_text())
+  req(resultados_busca_avancada$dados)
+  
+  pagina <- as.numeric(input$pagina_selecionada)
+  resultado <- resultados_busca_avancada$dados
+  texto_pagina <- output_text()[pagina]
+  palavras <- resultado$palavras_encontradas
+  
+  # Função para destacar todas as palavras encontradas
+  destacar_texto <- function(texto, palavras, case_sensitive = FALSE) {
+    texto_html <- texto
+    
+    # Para cada palavra, adicionar destaque
+    for (palavra in palavras) {
+      padrao <- paste0("\\b", palavra, "\\b")
+      texto_html <- gsub(
+        pattern = padrao, 
+        replacement = paste0('<span style="background-color: yellow; font-weight: bold;">', "\\0", '</span>'),
+        x = texto_html,
+        ignore.case = !case_sensitive
+      )
+    }
+    
+    return(texto_html)
+  }
+  
+  # Destacar o texto e renderizar
+  texto_destacado <- destacar_texto(texto_pagina, palavras, input$case_sensitive_avancado)
+  
+  output$texto_destacado <- renderUI({
+    tags$div(
+      class = "panel panel-default",
+      tags$div(
+        class = "panel-heading",
+        paste("Página", pagina, "com destaque para palavras relacionadas a '", input$busca_avancada, "'")
+      ),
+      tags$div(
+        class = "panel-body",
+        style = "max-height: 400px; overflow-y: auto; font-family: monospace; white-space: pre-wrap;",
+        HTML(texto_destacado)
+      )
+    )
+  })
+})
+```
+
+## 📝 Como usar
+
+1. Clique no botão "Procurar..." para selecionar um arquivo PDF
+2. Clique no botão "Analisar Documento" para processar o texto
+3. Explore os resultados nas diferentes abas:
+   - **Texto Extraído**: Veja o conteúdo do PDF, organizado por página
+   - **Termos Frequentes**: 
+     - Escolha entre contagem individual ou agrupada (combinando palavras similares)
+     - Use o controle de frequência mínima para filtrar os termos
+     - Use o buscador inteligente para encontrar palavras digitando apenas parte delas
+   - **Nuvem de Palavras**: 
+     - Veja uma representação visual dos termos mais frequentes
+     - Escolha entre visualização individual ou agrupada
+   - **Buscador Avançado**:
+     - Digite parte de uma palavra para encontrar todas as variações (com/sem acentos)
+     - Veja a distribuição das palavras encontradas por página
+     - Clique nas páginas para ver o texto com as palavras destacadas
+
+### Sobre o agrupamentos de palavras:
+
+A contagem agrupada combina palavras que são essencialmente as mesmas, mas escritas de formas diferentes:
+- Com ou sem acentos (ex: "manutenção" e "manutencao")
+- Maiúsculas ou minúsculas (ex: "Manutenção" e "manutenção")
+- Pequenas variações ortográficas (ex: palavras com ç/c, etc.)
+
+### **OBS**
+
+Palavras que possuem plural são tratadas como palavras não similares, exemplo:
+
+Recurso (singular) Recursos (plural), se a palvra "recurso" aparecer 10x e a sua forma no plural "recursos" aparecer 20x, elas não agrupa (10+20=30), mas mantém no relatório  as duas formas e a frequencia que elas apareceram.
+
+- recurso 10
+- recursos 20
+
+Isso permite uma análise mais precisa da frequência real dos termos no documento.
