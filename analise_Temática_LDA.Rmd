@@ -1,0 +1,717 @@
+---
+title: "Análise Temática de PDF com Identificação de Categorias"
+author: "Seu Nome"
+date: "`r Sys.Date()`"
+output: 
+  html_document:
+    theme: flatly
+    df_print: paged
+runtime: shiny
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE)
+# Aumentar o limite de upload para 30MB
+options(shiny.maxRequestSize = 30*1024^2)  # 30MB
+# Carregar todas as bibliotecas necessárias
+library(shiny)
+library(pdftools)
+library(tm)
+library(wordcloud)
+library(ggplot2)
+library(RColorBrewer)
+library(tidytext)    # Para tokenização
+library(dplyr)       # Para manipulação de dados
+library(stringr)     # Para funções de string
+library(tidyr)       # Para manipulação de dados tidyverse
+library(topicmodels) # Para modelagem de tópicos
+library(stm)         # Para modelagem de tópicos estruturais
+library(tidygraph)   # Para visualização de redes
+library(ggraph)      # Para visualização de redes
+library(igraph)      # Para análise de redes
+library(networkD3)   # Para visualização interativa de redes
+```
+
+## 📥 Upload e Análise do Arquivo PDF
+
+```{r ui-upload, echo=FALSE}
+fluidRow(
+  column(6, 
+    fileInput("arquivo_pdf", "Escolha um arquivo PDF", 
+              accept = ".pdf",
+              buttonLabel = "Procurar...")
+  ),
+  column(6,
+    actionButton("analisar", "Analisar Documento", 
+                icon = icon("play"),
+                class = "btn-primary",
+                style = "margin-top: 25px;")
+  )
+)
+```
+
+```{r server-analise, echo=FALSE}
+# Variáveis reativas para controlar o estado da análise
+analise_realizada <- reactiveValues(valor = FALSE)
+
+# Observer para o botão de análise
+observeEvent(input$analisar, {
+  req(input$arquivo_pdf)
+  analise_realizada$valor <- TRUE
+})
+
+# Texto extraído do PDF
+output_text <- reactive({
+  req(input$arquivo_pdf)
+  req(analise_realizada$valor)
+  # Extrair todas as páginas do PDF e manter a formatação por página
+  texto_pdf <- pdftools::pdf_text(input$arquivo_pdf$datapath)
+  return(texto_pdf)  # Retorna um vetor com cada página como um elemento
+})
+
+# Texto preparado para processamento
+texto_preparado <- reactive({
+  req(output_text())
+  
+  # Combinar todas as páginas em um único texto
+  texto_completo <- paste(output_text(), collapse = " ")
+  
+  # Remover caracteres especiais, números e pontuação
+  texto_limpo <- texto_completo %>%
+    str_to_lower() %>%
+    str_replace_all("[[:punct:]]", " ") %>%
+    str_replace_all("[[:digit:]]", " ") %>%
+    str_replace_all("\\s+", " ") %>%
+    str_trim()
+  
+  return(texto_limpo)
+})
+
+# Geração do corpus para análise de tópicos
+corpus_dtm <- reactive({
+  req(texto_preparado())
+  
+  # Criar corpus
+  corpus <- VCorpus(VectorSource(texto_preparado()))
+  
+  # Pré-processamento
+  corpus <- tm_map(corpus, content_transformer(tolower))
+  corpus <- tm_map(corpus, removePunctuation)
+  corpus <- tm_map(corpus, removeNumbers)
+  corpus <- tm_map(corpus, removeWords, stopwords("portuguese"))
+  corpus <- tm_map(corpus, stripWhitespace)
+  
+  # Criar matriz documento-termo
+  dtm <- DocumentTermMatrix(corpus)
+  
+  # Remover termos raros (que aparecem em menos de 1% dos documentos)
+  dtm_filtrado <- removeSparseTerms(dtm, 0.99)
+  
+  return(list(corpus = corpus, dtm = dtm_filtrado))
+})
+
+# Função para identificar tópicos usando LDA
+identificar_topicos <- reactive({
+  req(corpus_dtm())
+  
+  dtm <- corpus_dtm()$dtm
+  
+  # Verificar se há termos suficientes
+  if (ncol(dtm) < 10) {
+    return(NULL)
+  }
+  
+  # Ajustar o número de tópicos com base no tamanho do documento
+  # Sugestão: usar entre 3 e 10 tópicos para um documento típico
+  num_topicos <- min(10, max(3, ncol(dtm) %/% 50))
+  
+  tryCatch({
+    # Aplicar LDA para modelagem de tópicos
+    modelo_lda <- LDA(dtm, k = num_topicos, control = list(seed = 123))
+    
+    # Extrair os principais termos por tópico
+    beta <- tidy(modelo_lda, matrix = "beta")
+    
+    # Extrair os 10 principais termos para cada tópico
+    top_termos <- beta %>%
+      group_by(topic) %>%
+      top_n(10, beta) %>%
+      arrange(topic, -beta) %>%
+      mutate(topic_name = paste("Tópico", topic)) %>%
+      ungroup()
+    
+    # Extrair a distribuição de tópicos no documento
+    gamma <- tidy(modelo_lda, matrix = "gamma")
+    
+    # Calcular a probabilidade média de cada tópico
+    topico_prob <- gamma %>%
+      group_by(topic) %>%
+      summarise(probabilidade = mean(gamma)) %>%
+      arrange(desc(probabilidade))
+    
+    return(list(
+      modelo = modelo_lda,
+      top_termos = top_termos,
+      topico_prob = topico_prob
+    ))
+  }, error = function(e) {
+    # Em caso de erro na análise de tópicos
+    return(NULL)
+  })
+})
+
+# Função para avaliar a qualidade dos tópicos (alternativa simples ao ldatuning)
+avaliar_topicos <- reactive({
+  req(corpus_dtm())
+  
+  dtm <- corpus_dtm()$dtm
+  
+  # Verificar se há termos suficientes
+  if (ncol(dtm) < 10) {
+    return(NULL)
+  }
+  
+  # Definir uma sequência de números de tópicos para avaliar
+  k_values <- seq(2, min(20, ncol(dtm) %/% 10), by = 1)
+  
+  # Inicializar vetores para armazenar resultados
+  perplexities <- numeric(length(k_values))
+  coherence <- numeric(length(k_values))
+  
+  # Avaliar cada número de tópicos
+  for (i in seq_along(k_values)) {
+    k <- k_values[i]
+    
+    # Treinar modelo LDA
+    modelo_lda <- LDA(dtm, k = k, control = list(seed = 123))
+    
+    # Calcular perplexidade (menor é melhor)
+    perplexities[i] <- perplexity(modelo_lda)
+    
+    # Calcular uma medida simples de coerência baseada nos principais termos
+    beta <- tidy(modelo_lda, matrix = "beta")
+    top_terms_by_topic <- beta %>%
+      group_by(topic) %>%
+      top_n(10, beta) %>%
+      arrange(topic, -beta)
+    
+    # Uma medida simples de coerência é a média das probabilidades beta dos principais termos
+    # (maior é melhor)
+    coherence[i] <- mean(top_terms_by_topic$beta)
+  }
+  
+  # Criar um dataframe com os resultados
+  resultados <- data.frame(
+    k = k_values,
+    perplexidade = perplexities,
+    coerencia = coherence
+  )
+  
+  return(resultados)
+})
+
+# Identificação de categorias e temas recorrentes
+identificar_categorias <- reactive({
+  req(corpus_dtm())
+  
+  corpus <- corpus_dtm()$corpus
+  dtm <- corpus_dtm()$dtm
+  
+  # Extrair os termos mais frequentes
+  freq_termos <- colSums(as.matrix(dtm))
+  termos_ordenados <- sort(freq_termos, decreasing = TRUE)
+  
+  # Selecionar os 100 termos mais frequentes
+  top_termos <- data.frame(
+    termo = names(termos_ordenados)[1:min(100, length(termos_ordenados))],
+    frequencia = termos_ordenados[1:min(100, length(termos_ordenados))],
+    stringsAsFactors = FALSE
+  )
+  
+  # Criar uma matriz de co-ocorrência para análise de rede
+  if (ncol(dtm) > 5) {
+    # Converter para matriz
+    matriz_dtm <- as.matrix(dtm)
+    
+    # Calcular a matriz de co-ocorrência
+    coocorrencia <- t(matriz_dtm) %*% matriz_dtm
+    
+    # Transformar em matriz de adjacência para análise de rede
+    matriz_adj <- coocorrencia
+    diag(matriz_adj) <- 0
+    
+    # Limitar a 30 termos mais frequentes para a rede
+    termos_rede <- names(termos_ordenados)[1:min(30, length(termos_ordenados))]
+    matriz_rede <- matriz_adj[termos_rede, termos_rede]
+    
+    # Criar grafo
+    grafo <- graph_from_adjacency_matrix(
+      matriz_rede,
+      mode = "undirected",
+      weighted = TRUE
+    )
+    
+    # Calcular centralidade
+    centralidade <- data.frame(
+      termo = V(grafo)$name,
+      grau = degree(grafo),
+      intermediacao = betweenness(grafo),
+      proximidade = closeness(grafo),
+      stringsAsFactors = FALSE
+    )
+    
+    # Ordenar por grau
+    centralidade <- centralidade %>%
+      arrange(desc(grau))
+    
+    # Detecção de comunidades (categorias)
+    comunidades <- cluster_louvain(grafo)
+    
+    # Extrair os grupos
+    grupos <- data.frame(
+      termo = V(grafo)$name,
+      grupo = membership(comunidades),
+      stringsAsFactors = FALSE
+    )
+    
+    # Agrupar por grupo e extrair termos representativos
+    categorias <- grupos %>%
+      group_by(grupo) %>%
+      summarise(
+        termos = paste(termo, collapse = ", "),
+        num_termos = n()
+      ) %>%
+      arrange(desc(num_termos))
+    
+    return(list(
+      top_termos = top_termos,
+      grafo = grafo,
+      centralidade = centralidade,
+      categorias = categorias,
+      grupos = grupos
+    ))
+  } else {
+    # Caso não haja termos suficientes para análise de rede
+    return(list(
+      top_termos = top_termos,
+      grafo = NULL,
+      centralidade = NULL,
+      categorias = NULL,
+      grupos = NULL
+    ))
+  }
+})
+
+# Preparar dados para visualização de rede
+preparar_rede <- reactive({
+  req(identificar_categorias()$grafo)
+  
+  grafo <- identificar_categorias()$grafo
+  grupos <- identificar_categorias()$grupos
+  
+  # Adicionar informações de grupo aos vértices
+  V(grafo)$grupo <- grupos$grupo[match(V(grafo)$name, grupos$termo)]
+  
+  # Preparar dados para visualização D3
+  rede_d3 <- igraph_to_networkD3(grafo)
+  
+  # Adicionar grupos
+  rede_d3$nodes$group <- grupos$grupo[match(rede_d3$nodes$name, grupos$termo)]
+  
+  return(rede_d3)
+})
+```
+
+## 📊 Resultados da Análise
+
+```{r ui-resultados, echo=FALSE}
+# Mostrar os resultados apenas quando a análise for executada
+conditionalPanel(
+  condition = "input.analisar",
+  tabsetPanel(
+    tabPanel("Texto Extraído", 
+      h4("Texto do PDF (por página):"),
+      uiOutput("paginas_pdf")
+    ),
+    tabPanel("Análise de Tópicos",
+      h4("Modelagem de Tópicos (LDA)"),
+      sliderInput("num_topicos", "Número de tópicos:", 
+                  min = 2, max = 20, value = 5, step = 1),
+      uiOutput("info_topicos"),
+      plotOutput("grafico_topicos"),
+      h4("Principais Termos por Tópico"),
+      dataTableOutput("tabela_topicos"),
+      h4("Avaliação de Número de Tópicos"),
+      plotOutput("grafico_avaliacao_topicos")
+    ),
+    tabPanel("Análise de Categorias",
+      h4("Categorias Temáticas Identificadas"),
+      uiOutput("info_categorias"),
+      dataTableOutput("tabela_categorias"),
+      h4("Visualização de Rede de Termos"),
+      forceNetworkOutput("rede_termos", height = "500px"),
+      h4("Termos mais Centrais"),
+      dataTableOutput("tabela_centralidade")
+    ),
+    tabPanel("Nuvem de Palavras",
+      h4("Visualização dos Termos Mais Frequentes"),
+      plotOutput("nuvem_palavras", height = "500px")
+    )
+  )
+)
+```
+
+```{r server-resultados, echo=FALSE}
+# Mostrar texto extraído página por página com formatação melhorada
+output$paginas_pdf <- renderUI({
+  req(output_text())
+  
+  # Criar uma lista de elementos UI para cada página
+  paginas <- lapply(seq_along(output_text()), function(i) {
+    # Para cada página, criar um painel
+    wellPanel(
+      h5(paste("Página", i)),
+      tags$pre(
+        style = "white-space: pre-wrap; word-wrap: break-word; max-height: 300px; overflow-y: auto;",
+        output_text()[i]
+      )
+    )
+  })
+  
+  # Combinar todos os elementos em um único objeto UI
+  do.call(tagList, paginas)
+})
+
+# Modelo LDA com número de tópicos definido pelo usuário
+modelo_lda_dinamico <- reactive({
+  req(corpus_dtm())
+  req(input$num_topicos)
+  
+  dtm <- corpus_dtm()$dtm
+  
+  # Verificar se há termos suficientes
+  if (ncol(dtm) < 5) {
+    return(NULL)
+  }
+  
+  # Aplicar LDA para modelagem de tópicos
+  tryCatch({
+    modelo_lda <- LDA(dtm, k = input$num_topicos, control = list(seed = 123))
+    return(modelo_lda)
+  }, error = function(e) {
+    # Em caso de erro na análise de tópicos
+    return(NULL)
+  })
+})
+
+# Informações sobre tópicos
+output$info_topicos <- renderUI({
+  req(modelo_lda_dinamico())
+  
+  modelo <- modelo_lda_dinamico()
+  
+  if (is.null(modelo)) {
+    return(div(
+      class = "alert alert-warning",
+      "Não foi possível identificar tópicos suficientes no documento. Tente um documento maior ou com mais conteúdo textual."
+    ))
+  }
+  
+  # Extrair a distribuição de tópicos
+  gamma <- tidy(modelo, matrix = "gamma")
+  
+  # Calcular a probabilidade média de cada tópico
+  topico_prob <- gamma %>%
+    group_by(topic) %>%
+    summarise(probabilidade = mean(gamma)) %>%
+    arrange(desc(probabilidade))
+  
+  div(
+    class = "well",
+    h5("Resumo dos Tópicos Identificados:"),
+    p("Foram identificados", input$num_topicos, "tópicos principais no documento."),
+    p("A distribuição de probabilidade dos tópicos é:"),
+    div(
+      style = "display: flex; flex-wrap: wrap; gap: 10px;",
+      lapply(1:nrow(topico_prob), function(i) {
+        span(
+          style = paste0(
+            "padding: 8px; border-radius: 4px; margin-bottom: 5px; ",
+            "background-color: ", colorRampPalette(brewer.pal(8, "Set2"))(nrow(topico_prob))[i]
+          ),
+          paste0("Tópico ", topico_prob$topic[i], ": ", round(topico_prob$probabilidade[i] * 100, 1), "%")
+        )
+      })
+    )
+  )
+})
+
+# Gráfico de avaliação de tópicos
+output$grafico_avaliacao_topicos <- renderPlot({
+  req(avaliar_topicos())
+  
+  resultados <- avaliar_topicos()
+  
+  # Criar um gráfico para visualizar a perplexidade e coerência
+  p1 <- ggplot(resultados, aes(x = k, y = perplexidade)) +
+    geom_line() +
+    geom_point() +
+    labs(title = "Perplexidade (menor é melhor)",
+         x = "Número de tópicos (k)",
+         y = "Perplexidade") +
+    theme_minimal()
+  
+  p2 <- ggplot(resultados, aes(x = k, y = coerencia)) +
+    geom_line() +
+    geom_point() +
+    labs(title = "Coerência (maior é melhor)",
+         x = "Número de tópicos (k)",
+         y = "Coerência") +
+    theme_minimal()
+  
+  # Mostrar os dois gráficos lado a lado
+  gridExtra::grid.arrange(p1, p2, ncol = 2)
+})
+
+# Gráfico de tópicos
+output$grafico_topicos <- renderPlot({
+  req(modelo_lda_dinamico())
+  
+  modelo <- modelo_lda_dinamico()
+  
+  if (is.null(modelo)) {
+    # Gráfico vazio se não houver tópicos
+    ggplot() + 
+      annotate("text", x = 0.5, y = 0.5, label = "Sem tópicos para exibir") +
+      theme_void() +
+      xlim(0, 1) + ylim(0, 1)
+  } else {
+    # Extrair os termos mais importantes para cada tópico
+    beta <- tidy(modelo, matrix = "beta")
+    
+    # Gráfico de barras dos termos mais importantes para cada tópico
+    beta %>%
+      group_by(topic) %>%
+      top_n(10, beta) %>%
+      ungroup() %>%
+      mutate(
+        term = reorder_within(term, beta, topic),
+        topic_name = paste("Tópico", topic)
+      ) %>%
+      ggplot(aes(term, beta, fill = factor(topic))) +
+      geom_col(show.legend = FALSE) +
+      facet_wrap(~ topic_name, scales = "free_y") +
+      coord_flip() +
+      scale_x_reordered() +
+      labs(title = "Principais Termos por Tópico",
+           x = "Termo", 
+           y = "Importância (Beta)") +
+      theme_minimal() +
+      scale_fill_brewer(palette = "Set2")
+  }
+})
+
+# Tabela de tópicos
+output$tabela_topicos <- renderDataTable({
+  req(modelo_lda_dinamico())
+  
+  modelo <- modelo_lda_dinamico()
+  
+  if (is.null(modelo)) {
+    return(NULL)
+  }
+  
+  # Extrair termos e distribuição
+  beta <- tidy(modelo, matrix = "beta")
+  gamma <- tidy(modelo, matrix = "gamma")
+  
+  # Obter os principais termos por tópico
+  top_termos <- beta %>%
+    group_by(topic) %>%
+    top_n(10, beta) %>%
+    arrange(topic, -beta) %>%
+    group_by(topic) %>%
+    summarise(termos = paste(term, collapse = ", "))
+  
+  # Calcular a probabilidade média de cada tópico
+  topico_prob <- gamma %>%
+    group_by(topic) %>%
+    summarise(probabilidade = mean(gamma)) %>%
+    arrange(desc(probabilidade))
+  
+  # Juntar os dados
+  resultado <- top_termos %>%
+    left_join(topico_prob, by = "topic") %>%
+    mutate(
+      topic_name = paste("Tópico", topic),
+      probabilidade = paste0(round(probabilidade * 100, 1), "%")
+    ) %>%
+    select(
+      "Tópico" = topic_name,
+      "Probabilidade" = probabilidade,
+      "Principais Termos" = termos
+    )
+  
+  return(resultado)
+}, options = list(pageLength = 5, dom = 'tip'))
+
+# Informações sobre categorias
+output$info_categorias <- renderUI({
+  req(identificar_categorias())
+  
+  categorias <- identificar_categorias()
+  
+  if (is.null(categorias$categorias)) {
+    return(div(
+      class = "alert alert-warning",
+      "Não foi possível identificar categorias temáticas no documento. Tente um documento maior ou com mais conteúdo textual."
+    ))
+  }
+  
+  # Informações sobre as categorias identificadas
+  div(
+    class = "well",
+    h5("Resumo das Categorias Temáticas:"),
+    p("Foram identificadas", nrow(categorias$categorias), "categorias temáticas no documento."),
+    p("As categorias são definidas por grupos de palavras que tendem a ocorrer juntas no texto.")
+  )
+})
+
+# Tabela de categorias
+output$tabela_categorias <- renderDataTable({
+  req(identificar_categorias())
+  
+  categorias <- identificar_categorias()
+  
+  if (is.null(categorias$categorias)) {
+    return(NULL)
+  }
+  
+  # Preparar dados para a tabela
+  categorias$categorias %>%
+    mutate(
+      Categoria = paste("Categoria", grupo),
+      `Número de Termos` = num_termos,
+      `Termos Representativos` = termos
+    ) %>%
+    select(Categoria, `Número de Termos`, `Termos Representativos`)
+  
+}, options = list(pageLength = 5, dom = 'tip'))
+
+# Rede de termos
+output$rede_termos <- renderForceNetwork({
+  req(preparar_rede())
+  
+  rede_d3 <- preparar_rede()
+  
+  # Configurar a visualização
+  forceNetwork(
+    Links = rede_d3$links, 
+    Nodes = rede_d3$nodes,
+    Source = "source", 
+    Target = "target", 
+    NodeID = "name",
+    Group = "group", 
+    opacity = 0.8,
+    linkDistance = 100,
+    charge = -300,
+    fontSize = 14,
+    linkWidth = JS("function(d) { return Math.sqrt(d.value); }"),
+    colourScale = JS("d3.scaleOrdinal(d3.schemeCategory10);")
+  )
+})
+
+# Tabela de centralidade
+output$tabela_centralidade <- renderDataTable({
+  req(identificar_categorias()$centralidade)
+  
+  centralidade <- identificar_categorias()$centralidade
+  
+  if (is.null(centralidade)) {
+    return(NULL)
+  }
+  
+  # Preparar dados para a tabela
+  centralidade %>%
+    head(20) %>%
+    mutate(
+      `Intermediação` = round(intermediacao, 2),
+      `Proximidade` = round(proximidade, 5)
+    ) %>%
+    select(
+      "Termo" = termo,
+      "Grau" = grau,
+      "Intermediação",
+      "Proximidade"
+    )
+  
+}, options = list(pageLength = 10, dom = 'tip'))
+
+# Nuvem de palavras
+output$nuvem_palavras <- renderPlot({
+  req(identificar_categorias()$top_termos)
+  
+  top_termos <- identificar_categorias()$top_termos
+  
+  if (nrow(top_termos) > 0) {
+    set.seed(123)  # Para reprodutibilidade
+    tryCatch({
+      wordcloud(
+        words = top_termos$termo,
+        freq = top_termos$frequencia,
+        min.freq = 1,
+        max.words = 100,
+        random.order = FALSE,
+        rot.per = 0.35,
+        colors = brewer.pal(8, "Dark2"),
+        scale = c(4, 0.5)
+      )
+    }, error = function(e) {
+      # Em caso de erro, mostrar mensagem
+      plot(0, 0, type = "n", axes = FALSE, xlab = "", ylab = "")
+      text(0, 0, paste("Erro ao gerar nuvem:", e$message), cex = 1.2)
+    })
+  } else {
+    # Mensagem para quando não há palavras suficientes
+    plot(0, 0, type = "n", axes = FALSE, xlab = "", ylab = "")
+    text(0, 0, "Não há palavras suficientes para gerar a nuvem", cex = 1.5)
+  }
+})
+```
+
+## 📝 Como usar
+
+1. Clique no botão "Procurar..." para selecionar um arquivo PDF
+2. Clique no botão "Analisar Documento" para processar o texto
+3. Explore os resultados nas diferentes abas:
+   - **Texto Extraído**: Veja o conteúdo do PDF, organizado por página
+   - **Análise de Tópicos**: 
+     - Defina o número de tópicos desejado usando o controle deslizante
+     - Visualize os principais tópicos identificados no documento
+     - Veja os termos mais relevantes para cada tópico
+     - Analise métricas de avaliação para escolher o número ideal de tópicos
+   - **Análise de Categorias**: 
+     - Explore as categorias temáticas identificadas automaticamente
+     - Visualize a rede de termos para entender as relações
+     - Analise os termos mais centrais no documento
+   - **Nuvem de Palavras**: 
+     - Veja uma representação visual dos termos mais frequentes
+
+### Sobre a análise de tópicos:
+
+A análise de tópicos utiliza o algoritmo LDA (Latent Dirichlet Allocation) para identificar temas latentes no documento, agrupando palavras que tendem a ocorrer juntas. Cada tópico é representado por uma distribuição de probabilidade sobre as palavras, e cada documento é representado como uma mistura de tópicos.
+
+### Sobre a análise de categorias:
+
+A análise de categorias utiliza técnicas de análise de redes para identificar grupos de palavras que estão fortemente relacionadas entre si. Palavras que frequentemente ocorrem juntas ou em contextos similares são agrupadas em comunidades (categorias temáticas).
+
+### Métricas de avaliação de tópicos:
+
+- **Perplexidade**: Uma medida da qualidade do modelo - valores mais baixos indicam melhor ajuste.
+- **Coerência**: Uma medida de quão coerentes são os tópicos - valores mais altos indicam tópicos mais interpretáveis.
+
+### Métricas de centralidade:
+
+- **Grau**: Número de conexões que um termo possui com outros termos
+- **Intermediação**: Mede o quanto um termo serve como ponte entre outros termos
+- **Proximidade**: Mede o quão próximo um termo está de todos os outros termos da rede
