@@ -7,7 +7,6 @@ Scripts em R desenvolvido para realizar análise textual automatizada de documen
 
 Esta aplicação Shiny fornece uma interface intuitiva para análise textual de documentos PDF, com foco especial em textos em português. A ferramenta permite o upload de arquivos PDF, extração de texto, análise de frequência de palavras, visualização de resultados e busca avançada de termos.
 
-![Captura de tela da aplicação](https://via.placeholder.com/800x450)
 
 
 ## 🚀 Funcionalidades
