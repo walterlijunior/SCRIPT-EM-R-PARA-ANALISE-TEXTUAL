@@ -1,6 +1,6 @@
 ---
 title: "Análise Textual de PDF com Agrupamento de Palavras"
-author: "Seu Nome"
+author: "https://github.com/walterlijunior/SCRIPT-EM-R-PARA-ANALISE-TEXTUAL"
 date: "`r Sys.Date()`"
 output: 
   html_document:
@@ -25,6 +25,8 @@ library(dplyr)       # Para manipulação de dados
 library(stringr)     # Para funções de string
 library(tibble)      # Para criar tibbles
 library(stringdist)  # Para calcular distância entre strings
+library(DT)          # Para tabelas interativas
+library(scales)      # Para formatação de percentuais
 ```
 
 ## 📥 Upload e Análise do Arquivo PDF
@@ -48,6 +50,7 @@ fluidRow(
 ```{r server-analise, echo=FALSE}
 # Variáveis reativas para controlar o estado da análise
 analise_realizada <- reactiveValues(valor = FALSE)
+total_palavras <- reactiveVal(0)
 
 # Observer para o botão de análise
 observeEvent(input$analisar, {
@@ -155,7 +158,10 @@ texto_tokenizado <- reactive({
     filter(nchar(palavra) > 1) %>%
     # Remover stopwords
     anti_join(tibble(palavra = stopwords("portuguese")), by = "palavra")
-    
+  
+  # Atualizar o contador total de palavras
+  total_palavras(nrow(tokens))
+  
   return(tokens)
 })
 
@@ -167,6 +173,10 @@ frequencia_termos <- reactive({
   termos <- texto_tokenizado() %>%
     count(palavra, sort = TRUE) %>%
     rename(termo = palavra, frequencia = n)
+  
+  # Calcular percentual
+  termos <- termos %>%
+    mutate(percentual = frequencia / sum(frequencia) * 100)
     
   return(termos)
 })
@@ -178,7 +188,35 @@ frequencia_termos_agrupados <- reactive({
   # Agrupar palavras similares
   termos_agrupados <- agrupar_palavras_similares(frequencia_termos())
   
+  # Calcular percentual
+  termos_agrupados <- termos_agrupados %>%
+    mutate(percentual = frequencia / sum(frequencia) * 100)
+  
   return(termos_agrupados)
+})
+
+# Termos menos frequentes (palavras raras)
+termos_raros <- reactive({
+  req(frequencia_termos())
+  
+  # Pegar os termos menos frequentes (ordenados por frequência crescente)
+  termos <- frequencia_termos() %>%
+    arrange(frequencia) %>%
+    mutate(percentual = frequencia / sum(frequencia) * 100)
+  
+  return(termos)
+})
+
+# Termos raros agrupados
+termos_raros_agrupados <- reactive({
+  req(frequencia_termos_agrupados())
+  
+  # Ordenar por frequência crescente
+  termos <- frequencia_termos_agrupados() %>%
+    arrange(frequencia) %>%
+    mutate(percentual = frequencia / sum(frequencia) * 100)
+  
+  return(termos)
 })
 
 # Função de busca inteligente para encontrar palavras com prefixo
@@ -347,6 +385,15 @@ buscar_palavra_inteligente <- function(texto, termo, case_sensitive = FALSE) {
 # Mostrar os resultados apenas quando a análise for executada
 conditionalPanel(
   condition = "input.analisar",
+  # Mostrar contador de palavras
+  div(
+    class = "well well-sm",
+    style = "text-align: center; background-color: #f0f8ff; border-left: 4px solid #007bff;",
+    h4(
+      icon("info-circle"), 
+      textOutput("contador_palavras", inline = TRUE)
+    )
+  ),
   tabsetPanel(
     tabPanel("Texto Extraído", 
       h4("Texto do PDF (por página):"),
@@ -374,16 +421,52 @@ conditionalPanel(
         )
       ),
       h4("Tabela de Termos Mais Frequentes"),
-      tableOutput("tabela_termos"),
+      DTOutput("tabela_termos_dt"),
       h4("Gráfico de Barras (Top 10)"),
       plotOutput("grafico_barras")
     ),
+    tabPanel("Termos Raros",
+      h4("Palavras Menos Frequentes no Documento"),
+      fluidRow(
+        column(4,
+          radioButtons("tipo_contagem_raros", "Tipo de contagem:", 
+                     choices = c("Individual" = "individual", 
+                                "Agrupada (palavras similares)" = "agrupada"),
+                     selected = "agrupada"),
+          sliderInput("max_freq", "Frequência máxima:", 
+                     min = 1, max = 10, value = 3, step = 1),
+          numericInput("num_raros", "Número de termos a exibir:", 
+                      min = 5, max = 100, value = 20)
+        ),
+        column(8,
+          h4("Gráfico de Termos Raros"),
+          plotOutput("grafico_raros")
+        )
+      ),
+      h4("Tabela de Termos Raros"),
+      DTOutput("tabela_raros_dt")
+    ),
     tabPanel("Nuvem de Palavras",
       h4("Visualização dos Termos Mais Frequentes"),
-      radioButtons("tipo_contagem_nuvem", "Tipo de contagem:", 
-                 choices = c("Individual" = "individual", 
-                             "Agrupada (palavras similares)" = "agrupada"),
-                 selected = "agrupada", inline = TRUE),
+      fluidRow(
+        column(3, 
+          radioButtons("tipo_contagem_nuvem", "Tipo de contagem:", 
+                     choices = c("Individual" = "individual", 
+                                "Agrupada (palavras similares)" = "agrupada"),
+                     selected = "agrupada", inline = TRUE)
+        ),
+        column(4, 
+          sliderInput("min_freq_nuvem", "Frequência mínima:", 
+                    min = 1, max = 10, value = 1, step = 1)
+        ),
+        column(3, 
+          numericInput("max_palavras", "Máximo de palavras:", 
+                      min = 20, max = 300, value = 100)
+        ),
+        column(2,
+          checkboxInput("mostrar_raras", "Mostrar palavras raras", FALSE)
+        )
+      ),
       plotOutput("nuvem_palavras", height = "500px")
     ),
     tabPanel("Buscador Avançado",
@@ -408,6 +491,11 @@ conditionalPanel(
 ```
 
 ```{r server-resultados, echo=FALSE}
+# Exibir contador de palavras
+output$contador_palavras <- renderText({
+  paste("O documento contém um total de", total_palavras(), "palavras relevantes após a remoção de stopwords.")
+})
+
 # Mostrar texto extraído página por página com formatação melhorada
 output$paginas_pdf <- renderUI({
   req(output_text())
@@ -428,29 +516,73 @@ output$paginas_pdf <- renderUI({
   do.call(tagList, paginas)
 })
 
-# Tabela de termos frequentes com filtragem - CORRIGIDA
-output$tabela_termos <- renderTable({
+# Tabela melhorada de termos frequentes com DataTables
+output$tabela_termos_dt <- renderDT({
   req(input$min_freq)
   
   if (input$tipo_contagem == "individual") {
     req(frequencia_termos())
     df <- frequencia_termos() %>%
       filter(frequencia >= input$min_freq) %>%
-      head(20)
+      head(50) %>%
+      mutate(percentual = paste0(round(percentual, 2), "%"))
+    
+    # Renomear colunas para exibição
+    colnames(df) <- c("Termo", "Frequência", "Percentual (%)")
+    
   } else {
     req(frequencia_termos_agrupados())
     df <- frequencia_termos_agrupados() %>%
       filter(frequencia >= input$min_freq) %>%
-      head(20)
+      head(50) %>%
+      mutate(percentual = paste0(round(percentual, 2), "%"))
+    
+    # Renomear colunas para exibição
+    colnames(df) <- c("Termo", "Frequência", "Variantes", "Percentual (%)")
   }
   
-  # Garantir que não há problemas com rownames
-  rownames(df) <- NULL
-  
-  return(df)
-}, rownames = FALSE)
+  datatable(df, rownames = FALSE, options = list(
+    pageLength = 10,
+    lengthMenu = c(10, 25, 50),
+    dom = 'Blfrtip',
+    buttons = c('copy', 'csv', 'excel', 'pdf')
+  ))
+})
 
-# Gráfico de barras atualizado - CORRIGIDO
+# Tabela de termos raros com DataTables
+output$tabela_raros_dt <- renderDT({
+  req(input$max_freq, input$num_raros)
+  
+  if (input$tipo_contagem_raros == "individual") {
+    req(termos_raros())
+    df <- termos_raros() %>%
+      filter(frequencia <= input$max_freq) %>%
+      head(input$num_raros) %>%
+      mutate(percentual = paste0(round(percentual, 2), "%"))
+    
+    # Renomear colunas para exibição
+    colnames(df) <- c("Termo", "Frequência", "Percentual (%)")
+    
+  } else {
+    req(termos_raros_agrupados())
+    df <- termos_raros_agrupados() %>%
+      filter(frequencia <= input$max_freq) %>%
+      head(input$num_raros) %>%
+      mutate(percentual = paste0(round(percentual, 2), "%"))
+    
+    # Renomear colunas para exibição
+    colnames(df) <- c("Termo", "Frequência", "Variantes", "Percentual (%)")
+  }
+  
+  datatable(df, rownames = FALSE, options = list(
+    pageLength = 10,
+    lengthMenu = c(10, 25, 50),
+    dom = 'Blfrtip',
+    buttons = c('copy', 'csv', 'excel', 'pdf')
+  ))
+})
+
+# Gráfico de barras atualizado com percentuais
 output$grafico_barras <- renderPlot({
   req(input$min_freq)
   
@@ -468,11 +600,13 @@ output$grafico_barras <- renderPlot({
     if (nrow(top) > 0) {
       ggplot(top, aes(x = reorder(termo, frequencia), y = frequencia)) +
         geom_bar(stat = "identity", fill = "steelblue") +
-        geom_text(aes(label = frequencia), hjust = -0.2, size = 3.5) +  # Mostrar o número exato
+        geom_text(aes(label = paste0(frequencia, " (", round(percentual, 1), "%)")), 
+                 hjust = -0.1, size = 3.5) +  # Mostrar frequência e percentual
         coord_flip() +
         labs(title = "Top 10 Termos", x = "Termo", y = "Frequência") +
         theme_minimal() +
-        theme(axis.text.y = element_text(size = 11))
+        theme(axis.text.y = element_text(size = 11)) +
+        scale_y_continuous(expand = expansion(mult = c(0, 0.3)))  # Espaço para rótulos
     } else {
       # Gráfico vazio se não houver dados
       ggplot() + 
@@ -494,11 +628,13 @@ output$grafico_barras <- renderPlot({
     if (nrow(top) > 0) {
       ggplot(top, aes(x = reorder(termo, frequencia), y = frequencia)) +
         geom_bar(stat = "identity", fill = "steelblue") +
-        geom_text(aes(label = frequencia), hjust = -0.2, size = 3.5) +  # Mostrar o número exato
+        geom_text(aes(label = paste0(frequencia, " (", round(percentual, 1), "%)")), 
+                 hjust = -0.1, size = 3.5) +  # Mostrar frequência e percentual
         coord_flip() +
         labs(title = "Top 10 Termos (Agrupados)", x = "Termo", y = "Frequência") +
         theme_minimal() +
-        theme(axis.text.y = element_text(size = 11))
+        theme(axis.text.y = element_text(size = 11)) +
+        scale_y_continuous(expand = expansion(mult = c(0, 0.3)))  # Espaço para rótulos
     } else {
       # Gráfico vazio se não houver dados
       ggplot() + 
@@ -509,20 +645,39 @@ output$grafico_barras <- renderPlot({
   }
 })
 
-# Nuvem de palavras atualizada - CORRIGIDA
+# Nuvem de palavras corrigida
 output$nuvem_palavras <- renderPlot({
-  req(input$min_freq)
+  req(input$min_freq_nuvem, input$max_palavras)
   
-  # Selecionar os dados com base no tipo de contagem
-  if (input$tipo_contagem_nuvem == "individual") {
-    req(frequencia_termos())
-    palavras_freq <- frequencia_termos() %>%
-      filter(frequencia >= input$min_freq)
+  # Selecionar os dados com base no tipo de contagem e se mostra palavras raras
+  if (input$mostrar_raras) {
+    # Mostrar palavras raras
+    if (input$tipo_contagem_nuvem == "individual") {
+      req(termos_raros())
+      palavras_freq <- termos_raros() %>%
+        filter(frequencia <= 3) %>%
+        head(input$max_palavras)
+    } else {
+      req(termos_raros_agrupados())
+      palavras_freq <- termos_raros_agrupados() %>%
+        filter(frequencia <= 3) %>%
+        head(input$max_palavras) %>%
+        select(termo, frequencia)
+    }
   } else {
-    req(frequencia_termos_agrupados())
-    palavras_freq <- frequencia_termos_agrupados() %>%
-      filter(frequencia >= input$min_freq) %>%
-      select(termo, frequencia)  # Garantir que apenas as colunas necessárias estão presentes
+    # Mostrar palavras frequentes (comportamento padrão)
+    if (input$tipo_contagem_nuvem == "individual") {
+      req(frequencia_termos())
+      palavras_freq <- frequencia_termos() %>%
+        filter(frequencia >= input$min_freq_nuvem) %>%
+        head(input$max_palavras)
+    } else {
+      req(frequencia_termos_agrupados())
+      palavras_freq <- frequencia_termos_agrupados() %>%
+        filter(frequencia >= input$min_freq_nuvem) %>%
+        head(input$max_palavras) %>%
+        select(termo, frequencia)
+    }
   }
   
   # Remover linhas com NA em qualquer coluna
@@ -534,15 +689,29 @@ output$nuvem_palavras <- renderPlot({
   # Garantir que há palavras suficientes após a filtragem
   if(nrow(palavras_freq) > 0) {
     set.seed(123)  # Para reprodutibilidade
+    
+    # Determinar o número de cores necessárias (entre 3 e 8)
+    n_cores <- min(8, max(3, min(8, nrow(palavras_freq))))
+    
+    # Escolher a paleta de cores com base no tipo de visualização
+    color_palette <- if(input$mostrar_raras) {
+      brewer.pal(n_cores, "Pastel1")  # Cores mais suaves para palavras raras
+    } else {
+      brewer.pal(n_cores, "Dark2")    # Cores mais vibrantes para palavras frequentes
+    }
+    
+    # Definir a frequência mínima corretamente
+    freq_minima <- if(input$mostrar_raras) 1 else input$min_freq_nuvem
+    
     tryCatch({
       wordcloud(words = palavras_freq$termo,
                 freq = palavras_freq$frequencia,
-                min.freq = input$min_freq,
-                max.words = 100,
+                min.freq = freq_minima,
+                max.words = input$max_palavras,
                 random.order = FALSE,
-                rot.per = 0.35,  # Rotação de algumas palavras
-                colors = brewer.pal(8, "Dark2"),
-                scale = c(4, 0.5))  # Escala melhorada
+                rot.per = 0.35,
+                colors = color_palette,
+                scale = c(4, 0.5))
     }, error = function(e) {
       # Em caso de erro, mostrar mensagem
       plot(0, 0, type = "n", axes = FALSE, xlab = "", ylab = "")
@@ -551,7 +720,7 @@ output$nuvem_palavras <- renderPlot({
   } else {
     # Mensagem para quando não há palavras suficientes
     plot(0, 0, type = "n", axes = FALSE, xlab = "", ylab = "")
-    text(0, 0, "Não há palavras suficientes com esta frequência mínima", cex = 1.5)
+    text(0, 0, "Não há palavras suficientes com esta frequência", cex = 1.5)
   }
 })
 
@@ -566,6 +735,9 @@ observeEvent(input$buscar, {
   # Exibir o resultado
   output$resultado_busca <- renderUI({
     if (resultado$total > 0) {
+      # Calcular percentual do total de palavras
+      percentual <- (resultado$total / total_palavras()) * 100
+      
       tags$div(
         class = "well",
         style = "background-color: #f8f9fa; border-left: 4px solid #5bc0de; padding: 15px;",
@@ -587,23 +759,31 @@ observeEvent(input$buscar, {
               }
             }))
             
+            # Calcular percentual para esta palavra específica
+            percentual_palavra <- (ocorrencias_palavra / total_palavras()) * 100
+            
             tags$span(
               class = "badge",
               style = "background-color: #5bc0de; margin: 2px; padding: 5px;",
-              paste0(palavra, " (", ocorrencias_palavra, ")")
+              paste0(palavra, " (", ocorrencias_palavra, " - ", round(percentual_palavra, 2), "%)")
             )
           })
         ),
         tags$hr(),
-        tags$p("Total de ocorrências: ", tags$b(resultado$total)),
+        tags$p("Total de ocorrências: ", tags$b(paste0(resultado$total, " (", round(percentual, 2), "% do total)")), 
+               " de um total de ", tags$b(total_palavras()), " palavras no documento"),
         tags$p("Distribuição por página:"),
         tags$div(
           style = "display: flex; flex-wrap: wrap; gap: 5px;",
           lapply(seq_along(resultado$por_pagina), function(i) {
             if (resultado$por_pagina[i] > 0) {
+              # Calcular percentual para esta página específica em relação ao total de ocorrências
+              percentual_pagina <- (resultado$por_pagina[i] / resultado$total) * 100
+              
               tags$span(
                 style = "background-color: #e2e3e5; padding: 3px 8px; border-radius: 4px; margin: 2px;",
-                paste("Página", i, ":", resultado$por_pagina[i])
+                paste("Página", i, ":", resultado$por_pagina[i], 
+                      sprintf("(%.1f%%)", percentual_pagina))
               )
             }
           })
@@ -636,9 +816,18 @@ observeEvent(input$buscar_avancado, {
   # Exibir as palavras encontradas
   output$palavras_encontradas <- renderUI({
     if (length(resultado$palavras_encontradas) > 0) {
+      # Calcular percentual do total de palavras
+      percentual_total <- (resultado$total / total_palavras()) * 100
+      
       tags$div(
         class = "alert alert-info",
         tags$strong("Palavras encontradas: "),
+        tags$div(
+          style = "margin-bottom: 10px;",
+          paste0("Encontradas ", length(resultado$palavras_encontradas), 
+                " termos relacionados a '", input$busca_avancada, "', representando ",
+                round(percentual_total, 2), "% do total de palavras do documento.")
+        ),
         tags$div(
           style = "display: flex; flex-wrap: wrap; gap: 5px; margin-top: 10px;",
           lapply(resultado$palavras_encontradas, function(palavra) {
@@ -651,10 +840,16 @@ observeEvent(input$buscar_avancado, {
               }
             }))
             
+            # Calcular percentual para esta palavra específica
+            percentual_palavra <- (ocorrencias_palavra / total_palavras()) * 100
+            percentual_grupo <- (ocorrencias_palavra / resultado$total) * 100
+            
             tags$span(
               class = "badge",
               style = "background-color: #5bc0de; margin: 2px; padding: 5px;",
-              paste0(palavra, " (", ocorrencias_palavra, ")")
+              paste0(palavra, " (", ocorrencias_palavra, " - ", 
+                    round(percentual_palavra, 2), "% do total, ", 
+                    round(percentual_grupo, 1), "% do grupo)")
             )
           })
         )
@@ -670,21 +865,29 @@ observeEvent(input$buscar_avancado, {
   # Exibir o resultado da busca
   output$resultado_busca_avancada <- renderUI({
     if (resultado$total > 0) {
+      # Calcular percentual do total de palavras
+      percentual_total <- (resultado$total / total_palavras()) * 100
+      
       tags$div(
         class = "alert alert-success",
         tags$strong("Resultados da busca:"), 
         paste(" Encontradas", resultado$total, 
               ifelse(resultado$total == 1, "ocorrência", "ocorrências"), 
-              "de palavras relacionadas a", tags$b(input$busca_avancada)),
+              "de palavras relacionadas a", tags$b(input$busca_avancada),
+              sprintf("(%.2f%% do total de palavras)", percentual_total)),
         tags$hr(),
         tags$p("Clique em uma página para ver o texto com destaque:"),
         tags$div(
           style = "display: flex; flex-wrap: wrap; gap: 10px;",
           lapply(seq_along(resultado$por_pagina), function(i) {
             if (resultado$por_pagina[i] > 0) {
+              # Calcular percentual para esta página específica
+              percentual_pagina <- (resultado$por_pagina[i] / resultado$total) * 100
+              
               actionButton(
                 inputId = paste0("pagina_", i),
-                label = paste("Página", i, "(", resultado$por_pagina[i], ")"),
+                label = paste("Página", i, "(", resultado$por_pagina[i], 
+                             sprintf(" - %.1f%%)", percentual_pagina)),
                 class = "btn-sm btn-info",
                 onclick = sprintf("Shiny.setInputValue('pagina_selecionada', %d);", i)
               )
@@ -712,20 +915,48 @@ observeEvent(input$pagina_selecionada, {
   texto_pagina <- output_text()[pagina]
   palavras <- resultado$palavras_encontradas
   
-  # Função para destacar todas as palavras encontradas
+  # Função para destacar todas as palavras encontradas com cores diferentes
   destacar_texto <- function(texto, palavras, case_sensitive = FALSE) {
     texto_html <- texto
     
-    # Para cada palavra, adicionar destaque
-    for (palavra in palavras) {
+    # Gerar cores para cada palavra encontrada
+    num_palavras <- length(palavras)
+    cores <- colorRampPalette(brewer.pal(min(8, max(3, num_palavras)), "Set1"))(num_palavras)
+    
+    # Para cada palavra, adicionar destaque com uma cor específica
+    for (i in seq_along(palavras)) {
+      palavra <- palavras[i]
+      cor <- cores[i]
       padrao <- paste0("\\b", palavra, "\\b")
+      
       texto_html <- gsub(
         pattern = padrao, 
-        replacement = paste0('<span style="background-color: yellow; font-weight: bold;">', "\\0", '</span>'),
+        replacement = paste0('<span style="background-color: ', cor, '; color: white; font-weight: bold; padding: 0 2px; border-radius: 3px;">', "\\0", '</span>'),
         x = texto_html,
         ignore.case = !case_sensitive
       )
     }
+    
+    # Adicionar contador e legenda de cores
+    texto_html <- paste0(
+      '<div style="margin-bottom: 10px; font-size: 0.9em; background-color: #f0f0f0; padding: 5px; border-radius: 4px;">',
+      '<strong>Legenda:</strong><br>',
+      paste(sapply(seq_along(palavras), function(i) {
+        palavra <- palavras[i]
+        cor <- cores[i]
+        # Contar ocorrências dessa palavra na página
+        ocorrencias <- length(gregexpr(paste0("\\b", palavra, "\\b"), texto_pagina, ignore.case = !case_sensitive)[[1]])
+        if (ocorrencias[1] != -1) {
+          paste0('<span style="display: inline-block; margin: 2px 5px; padding: 0 5px; background-color: ', 
+                cor, '; color: white; border-radius: 3px;">', palavra, 
+                ' (', ocorrencias, ' ocorrências)</span>')
+        } else {
+          ""
+        }
+      }), collapse = " "),
+      '</div>',
+      texto_html
+    )
     
     return(texto_html)
   }
@@ -733,16 +964,26 @@ observeEvent(input$pagina_selecionada, {
   # Destacar o texto e renderizar
   texto_destacado <- destacar_texto(texto_pagina, palavras, input$case_sensitive_avancado)
   
+  # Contar palavras na página
+  palavras_pagina <- sum(resultado$por_pagina[pagina])
+  palavras_total <- resultado$total
+  percentual_pagina <- (palavras_pagina / palavras_total) * 100
+  
   output$texto_destacado <- renderUI({
     tags$div(
       class = "panel panel-default",
       tags$div(
         class = "panel-heading",
-        paste("Página", pagina, "com destaque para palavras relacionadas a '", input$busca_avancada, "'")
+        paste("Página", pagina, "com destaque para palavras relacionadas a '", input$busca_avancada, "'"),
+        tags$span(
+          class = "badge pull-right",
+          style = "background-color: #5bc0de;",
+          paste0(palavras_pagina, " ocorrências (", round(percentual_pagina, 1), "% do total)")
+        )
       ),
       tags$div(
         class = "panel-body",
-        style = "max-height: 400px; overflow-y: auto; font-family: monospace; white-space: pre-wrap;",
+        style = "max-height: 500px; overflow-y: auto; font-family: monospace; white-space: pre-wrap;",
         HTML(texto_destacado)
       )
     )
@@ -760,13 +1001,19 @@ observeEvent(input$pagina_selecionada, {
      - Escolha entre contagem individual ou agrupada (combinando palavras similares)
      - Use o controle de frequência mínima para filtrar os termos
      - Use o buscador inteligente para encontrar palavras digitando apenas parte delas
+     - Visualize frequências absolutas e relativas (percentuais)
+   - **Termos Raros**:
+     - Analise as palavras menos frequentes no documento
+     - Configure a frequência máxima para definir o que é considerado "raro"
+     - Visualize em formato de tabela e gráfico com frequências e percentuais
    - **Nuvem de Palavras**: 
-     - Veja uma representação visual dos termos mais frequentes
+     - Veja uma representação visual dos termos mais frequentes ou mais raros
      - Escolha entre visualização individual ou agrupada
+     - Configure o número máximo de palavras a serem exibidas
    - **Buscador Avançado**:
      - Digite parte de uma palavra para encontrar todas as variações (com/sem acentos)
-     - Veja a distribuição das palavras encontradas por página
-     - Clique nas páginas para ver o texto com as palavras destacadas
+     - Veja a distribuição das palavras encontradas por página com percentuais
+     - Clique nas páginas para ver o texto com as palavras destacadas em cores diferentes
 
 ### Sobre o agrupamentos de palavras:
 
@@ -785,3 +1032,4 @@ Recurso (singular) Recursos (plural), se a palvra "recurso" aparecer 10x e a sua
 - recursos 20
 
 Isso permite uma análise mais precisa da frequência real dos termos no documento.
+
