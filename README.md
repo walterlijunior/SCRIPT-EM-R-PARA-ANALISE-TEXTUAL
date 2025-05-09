@@ -9,6 +9,7 @@ Esta aplicação Shiny fornece uma interface intuitiva para análise textual de 
 
 ![Captura de tela da aplicação](https://via.placeholder.com/800x450)
 
+
 ## 🚀 Funcionalidades
 
 - **Extração de texto** de arquivos PDF
@@ -393,6 +394,9 @@ replacement = paste0('<span style="background-color: ', cor,
                     "\\0", '</span>'),
 ```
 
+
+
+
 ## 🤝 Contribuições
 
 Contribuições são bem-vindas! Sinta-se à vontade para abrir issues ou enviar pull requests.
@@ -403,5 +407,5 @@ Este projeto está licenciado sob a [MIT License](LICENSE).
 
 ## 👤 Autor
 
-- **Autor Original**: [Walter Li Junior](https://github.com/walterlijunior)
+- **Autor Original**: [Walterli Junior](https://github.com/walterlijunior)
 - **Repositório**: [SCRIPT-EM-R-PARA-ANALISE-TEXTUAL](https://github.com/walterlijunior/SCRIPT-EM-R-PARA-ANALISE-TEXTUAL)
